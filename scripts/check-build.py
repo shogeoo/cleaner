@@ -8,7 +8,7 @@ import subprocess
 import wave
 
 root = pathlib.Path(__file__).resolve().parents[1]
-exe = root / 'dist/DesktopPrank.exe'
+exe = root / 'dist/cleaner.exe'
 b = exe.read_bytes()
 u16 = lambda o: struct.unpack_from('<H', b, o)[0]
 u32 = lambda o: struct.unpack_from('<I', b, o)[0]
