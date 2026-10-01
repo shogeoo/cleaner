@@ -109,7 +109,7 @@ std::wstring display(IShellItem* item,SIGDN kind){PWSTR p=nullptr;if(FAILED(item
 POINT screenPoint(POINT p){Ptr<IOleWindow> window;check(desktop->QueryInterface(IID_PPV_ARGS(window.out())),"View window unavailable");HWND h;check(window->GetWindow(&h),"View handle unavailable");ClientToScreen(h,&p);return p;}
 POINT iconCenter(const Entry& e){
  POINT position{};check(desktop->GetItemPosition(childPidl(e.child),&position),"Cannot locate current icon");
- POINT spacing{};UINT mode=0;int size=32;
+ POINT spacing{};FOLDERVIEWMODE mode=FVM_ICON;int size=32;
  check(desktop->GetSpacing(&spacing),"Cannot read icon spacing");check(desktop->GetViewModeAndIconSize(&mode,&size),"Cannot read icon size");
  position.x+=spacing.x/2;position.y+=size/2+4;return screenPoint(position);
 }
@@ -186,7 +186,7 @@ void mouseInput(DWORD flags,POINT p){INPUT in{};in.type=INPUT_MOUSE;in.mi.dwFlag
  if(flags&MOUSEEVENTF_MOVE){int x=GetSystemMetrics(SM_XVIRTUALSCREEN),y=GetSystemMetrics(SM_YVIRTUALSCREEN),width=GetSystemMetrics(SM_CXVIRTUALSCREEN),height=GetSystemMetrics(SM_CYVIRTUALSCREEN);in.mi.dx=MulDiv(p.x-x,65535,std::max(1,width-1));in.mi.dy=MulDiv(p.y-y,65535,std::max(1,height-1));in.mi.dwFlags|=MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_VIRTUALDESK;}
  if(SendInput(1,&in,sizeof(in))!=1)throw std::runtime_error("Mouse injection failed");
 }
-void glide(POINT from,POINT to){double distance=std::hypot(double(to.x-from.x),double(to.y-from.y));int steps=std::max(1,int(std::ceil(distance/14.0)));
+void glide(POINT from,POINT to){double distance=std::hypot(double(to.x-from.x),double(to.y-from.y));int steps=std::max(1,int(std::ceil(distance/13.5)));
  for(int i=1;i<=steps&&!stopped;i++){POINT p{from.x+LONG(std::lround(double(to.x-from.x)*i/steps)),from.y+LONG(std::lround(double(to.y-from.y)*i/steps))};mouseInput(MOUSEEVENTF_MOVE,p);waitMs(25);}}
 void drag(size_t index,POINT bin){
  current=index;dropReceived=false;POINT start=iconCenter(entries[index]);
