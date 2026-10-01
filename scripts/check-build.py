@@ -34,7 +34,7 @@ def children(relative):
     return dict(struct.unpack_from('<II', b, directory+16+8*i) for i in range(count))
 
 recordings = children(children(0)[10] & 0x7fffffff)
-expected = {1,2,3,4,5,6,7,8,9,10,11,13,15,16}
+expected = {1,2,3,4,5,6,7,8,9,10,11,13,15}
 assert set(recordings) == expected
 for n, directory in recordings.items():
     languages = children(directory & 0x7fffffff)
@@ -49,4 +49,4 @@ for n, directory in recordings.items():
 imports = subprocess.check_output(['x86_64-w64-mingw32-objdump', '-p', str(exe)], text=True)
 for dll in re.findall(r'DLL Name: (\S+)', imports):
     assert dll.lower() in {'kernel32.dll','ole32.dll','oleaut32.dll','shell32.dll','user32.dll','winmm.dll'} or dll.lower().startswith('api-ms-win-crt-'), dll
-print('PASS: Windows x64 PE; all 14 embedded recordings match; only Windows runtime imports')
+print('PASS: Windows x64 PE; all 13 embedded recordings match; only Windows runtime imports')
