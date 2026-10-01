@@ -20,6 +20,9 @@
 #include <cstring>
 #include <mutex>
 #include <cstdio>
+#include <deque>
+#include <random>
+#include "sound_director.hpp"
 
 // Shell calls run on the UI STA; audio and input hooks use separate threads.
 template<class T> struct Ptr {
@@ -56,32 +59,36 @@ void requireWin32(BOOL ok,const char* what){if(!ok)throw std::runtime_error(std:
 const char* stage="entry";
 void enterStage(const char* value){stage=value;logFile.write(std::string("STAGE ")+stage);}
 std::atomic<bool> blocked{false}, done{false};
-std::atomic<unsigned> attempts{0};
 HHOOK keyboard=nullptr,mouse=nullptr;
 constexpr ULONG_PTR tag=0x5052414E;
-DWORD lastAttempt=0; HWND targetWindow=nullptr;
-struct Entry { std::wstring name, skipReason; BY_HANDLE_FILE_INFORMATION identity{}; bool checked=false; std::wstring path; std::vector<BYTE> child; bool recycleBin=false; bool eligible=false; bool moved=false; };
+HWND targetWindow=nullptr;
+cleaner::InputAttempts inputAttempts;
+struct Entry { std::wstring name, skipReason; BY_HANDLE_FILE_INFORMATION identity{}; bool checked=false; std::wstring path; std::vector<BYTE> child; bool recycleBin=false; bool shortcut=false; bool eligible=false; bool moved=false; };
 std::vector<Entry> entries; std::wstring pathList;
 IShellView* shellView=nullptr;
 IFolderView2* desktop=nullptr; size_t current=SIZE_MAX; bool dropReceived=false;
-std::atomic<unsigned long long> audioRequest{0}, audioApplied{0};
-std::atomic<ULONGLONG> audioEnd{0};
-std::atomic<bool> audioDone{false};
-void requestAudio(int id){
- auto old=audioRequest.load();
- while(!audioRequest.compare_exchange_weak(old,(((old>>8)+1)<<8)|static_cast<unsigned>(id))){}
+std::atomic<bool> audioDone{false}, workReady{false}, soundFinished{false};
+std::mutex soundQueueLock;
+std::deque<cleaner::SoundEvent> soundQueue;
+void postSound(cleaner::SoundEvent event){
+ std::lock_guard<std::mutex> guard(soundQueueLock);soundQueue.push_back(event);
 }
-void voice(int id){requestAudio(id);}
-void intervention(){DWORD now=GetTickCount();if(!lastAttempt||now-lastAttempt>=6000){lastAttempt=now;attempts.fetch_add(1);}}
+void intervention(){postSound({cleaner::SoundEventType::Interference});}
 LRESULT CALLBACK keyHook(int n,WPARAM w,LPARAM l){
  if(n>=0){auto* k=reinterpret_cast<KBDLLHOOKSTRUCT*>(l);
   if(k->dwExtraInfo==tag)return CallNextHookEx(keyboard,n,w,l);
   bool down=w==WM_KEYDOWN||w==WM_SYSKEYDOWN;
-  if(blocked){if(down)intervention();return 1;}
+  bool fresh=inputAttempts.key(k->vkCode,down);
+  if(blocked){if(fresh)intervention();return 1;}
  }return CallNextHookEx(keyboard,n,w,l);
 }
 LRESULT CALLBACK mouseHook(int n,WPARAM w,LPARAM l){
- if(n>=0&&blocked){auto* m=reinterpret_cast<MSLLHOOKSTRUCT*>(l);if(m->dwExtraInfo!=tag){intervention();return 1;}}
+ if(n>=0&&blocked){auto* m=reinterpret_cast<MSLLHOOKSTRUCT*>(l);if(m->dwExtraInfo!=tag){
+  bool attempt=w==WM_LBUTTONDOWN||w==WM_RBUTTONDOWN||w==WM_MBUTTONDOWN||w==WM_XBUTTONDOWN||w==WM_MOUSEWHEEL||w==WM_MOUSEHWHEEL;
+  if(w==WM_MOUSEMOVE)attempt=inputAttempts.mouseMove(GetTickCount64());
+  if(attempt)intervention();
+  return 1;
+ }}
  return CallNextHookEx(mouse,n,w,l);
 }
 void pump(){MSG m;while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}}
@@ -94,28 +101,37 @@ DWORD wavDuration(const BYTE* p,DWORD size){
  if(!memcmp(p+i,"data",4))data=len;
  if(len>MAXDWORD-i-9)break;
  i+=8+len+(len&1);}
- return rate?static_cast<DWORD>(1000ull*data/rate)+100:0;
+ return rate?static_cast<DWORD>((1000ull*data+rate-1)/rate):0;
 }
 void audioLoop(){
- unsigned observed=0;bool first=true;
+ std::array<const BYTE*,17> recordings{};std::array<cleaner::Millis,17> durations{};
+ for(int id:{1,2,3,4,5,6,7,8,9,10,11,13,15}){
+  HRSRC r=FindResourceW(nullptr,MAKEINTRESOURCEW(id),RT_RCDATA);
+  recordings[id]=r?static_cast<const BYTE*>(LockResource(LoadResource(nullptr,r))):nullptr;
+  durations[id]=recordings[id]?wavDuration(recordings[id],SizeofResource(nullptr,r)):0;
+ }
+ std::mt19937 random(static_cast<unsigned>(GetTickCount64()^GetCurrentProcessId()));
+ cleaner::SoundDirector director(durations,[&](unsigned upper){return std::uniform_int_distribution<unsigned>(0,upper-1)(random);});
+ std::uint64_t applied=0;
+ auto render=[&]{
+  if(director.generation()==applied)return;
+  int id=director.currentClip();
+  PlaySoundW(nullptr,nullptr,0);
+  if(id==1){blocked=true;logFile.write("INPUT_BLOCKED first recording");}
+  bool ok=id&&recordings[id]&&PlaySoundW(reinterpret_cast<LPCWSTR>(recordings[id]),nullptr,SND_MEMORY|SND_ASYNC|SND_NODEFAULT);
+  applied=director.generation();
+  logFile.write("AUDIO id="+std::to_string(id)+" generation="+std::to_string(applied)+" started="+std::to_string(ok)+" durationMs="+std::to_string(id?durations[id]:0));
+ };
  while(!audioDone){
-  if(blocked){unsigned count=attempts.load();if(count!=observed){observed=count;voice(first?3:11);first=false;}}
-  auto request=audioRequest.load();
-  if(request!=audioApplied.load()){
-   int id=static_cast<int>(request&255);HRSRC r=FindResourceW(nullptr,MAKEINTRESOURCEW(id),RT_RCDATA);
-   const BYTE* p=r?static_cast<const BYTE*>(LockResource(LoadResource(nullptr,r))):nullptr;
-   DWORD duration=p?wavDuration(p,SizeofResource(nullptr,r)):0;
-   PlaySoundW(nullptr,nullptr,0);
-   bool ok=p&&duration&&PlaySoundW(reinterpret_cast<LPCWSTR>(p),nullptr,SND_MEMORY|SND_ASYNC|SND_NODEFAULT);
-   audioEnd=GetTickCount64()+(ok?duration:0);audioApplied=request;
-   logFile.write("AUDIO id="+std::to_string(id)+" started="+std::to_string(ok)+" durationMs="+std::to_string(duration));
-  }
-  Sleep(5);
+  std::deque<cleaner::SoundEvent> events;
+  {std::lock_guard<std::mutex> guard(soundQueueLock);events.swap(soundQueue);}
+  for(const auto& event:events){director.event(event,GetTickCount64());render();}
+  director.tick(GetTickCount64());render();
+  if(director.phase()==cleaner::SoundPhase::Work)workReady=true;
+  if(director.phase()==cleaner::SoundPhase::Finished)soundFinished=true;
+  Sleep(2);
  }
  PlaySoundW(nullptr,nullptr,0);
-}
-void waitAudio(){
- do{waitMs(5);}while(audioApplied.load()!=audioRequest.load()||GetTickCount64()<audioEnd.load());
 }
 
 std::vector<BYTE> pidlBytes(PCUIDLIST_RELATIVE p){UINT n=ILGetSize(p);return std::vector<BYTE>(reinterpret_cast<const BYTE*>(p),reinterpret_cast<const BYTE*>(p)+n);}
@@ -207,6 +223,7 @@ void snapshot(){
  int count=0;check(desktop->ItemCount(SVGIO_ALLVIEW,&count),"Cannot enumerate icons");
  for(int i=0;i<count;i++){PITEMID_CHILD child=nullptr;if(FAILED(desktop->Item(i,&child))||!child)continue;Entry e;e.child=pidlBytes(child);
  Ptr<IShellItem> item;HRESULT hr=SHCreateItemWithParent(nullptr,folder,child,IID_PPV_ARGS(item.out()));CoTaskMemFree(child);if(FAILED(hr))continue;e.path=display(item,SIGDN_FILESYSPATH);e.name=display(item,SIGDN_NORMALDISPLAY);e.skipReason=L"Виртуальный или системный значок";
+ SFGAOF link=0;e.shortcut=SUCCEEDED(item->GetAttributes(SFGAO_LINK,&link))&&(link&SFGAO_LINK);
  int order=1;HRESULT comparison=item->Compare(bin,SICHINT_CANONICAL,&order);e.recycleBin=SUCCEEDED(comparison)&&order==0;
  logFile.write("ENUM name="+utf8(e.name)+" parsing="+utf8(display(item,SIGDN_DESKTOPABSOLUTEPARSING))+" binCompare="+hexCode(static_cast<unsigned long>(comparison))+" order="+std::to_string(order));
  if(!e.path.empty()){size_t slash=e.path.find_last_of(L"\\/");std::wstring parent=e.path.substr(0,slash);DWORD attrs=GetFileAttributesW(e.path.c_str());
@@ -238,7 +255,10 @@ struct Sink : IFileOperationProgressSink {
  return (flags&TSF_DELETE_RECYCLE_IF_POSSIBLE)?S_OK:E_ABORT;
  }
  HRESULT STDMETHODCALLTYPE PostDeleteItem(DWORD,IShellItem*,HRESULT h,IShellItem* recycled)override{
- result=h;logFile.write("RECYCLE result="+hexCode(static_cast<unsigned long>(h))+" binItem="+std::to_string(recycled!=nullptr));if(SUCCEEDED(h)&&recycled){entry->moved=true;captured=true;}return S_OK;
+ result=h;logFile.write("RECYCLE result="+hexCode(static_cast<unsigned long>(h))+" binItem="+std::to_string(recycled!=nullptr));if(SUCCEEDED(h)&&recycled){
+ entry->moved=true;captured=true;postSound({cleaner::SoundEventType::Recycled});
+ if(std::none_of(entries.begin(),entries.end(),[](const Entry& e){return e.eligible&&!e.moved;}))postSound({cleaner::SoundEventType::Finish,false,false,false,true});
+ }return S_OK;
  }
  HRESULT STDMETHODCALLTYPE PreNewItem(DWORD,IShellItem*,LPCWSTR)override{return E_ABORT;}
  HRESULT STDMETHODCALLTYPE PostNewItem(DWORD,IShellItem*,LPCWSTR,LPCWSTR,DWORD,HRESULT,IShellItem*)override{return S_OK;}
@@ -279,7 +299,7 @@ void mouseInput(DWORD flags,POINT p){INPUT in{};in.type=INPUT_MOUSE;in.mi.dwFlag
  if(SendInput(1,&in,sizeof(in))!=1)requireWin32(FALSE,"SendInput mouse");
 }
 void glide(POINT from,POINT to){double distance=std::hypot(double(to.x-from.x),double(to.y-from.y));int steps=std::max(1,int(std::ceil(distance/13.5)));
- for(int i=1;i<=steps;i++){POINT p{from.x+LONG(std::lround(double(to.x-from.x)*i/steps)),from.y+LONG(std::lround(double(to.y-from.y)*i/steps))};mouseInput(MOUSEEVENTF_MOVE,p);waitMs(25);}}
+ for(int i=1;i<=steps;i++){POINT p{from.x+LONG(std::lround(double(to.x-from.x)*i/steps)),from.y+LONG(std::lround(double(to.y-from.y)*i/steps))};mouseInput(MOUSEEVENTF_MOVE,p);waitMs(10);}}
 struct DragRelease {
  bool pressed=false;
  ~DragRelease(){if(!pressed)return;INPUT in[3]{};for(auto& x:in)x.type=INPUT_KEYBOARD;
@@ -291,9 +311,11 @@ void drag(size_t index,POINT bin){
  current=index;dropReceived=false;POINT start=iconCenter(entries[index]);
  auto selected=childPidl(entries[index].child);
  check(desktop->SelectAndPositionItems(1,&selected,nullptr,SVSI_SELECT|SVSI_DESELECTOTHERS),"Cannot select source icon");
+ DWORD attributes=GetFileAttributesW(entries[index].path.c_str());bool folder=attributes!=INVALID_FILE_ATTRIBUTES&&(attributes&FILE_ATTRIBUTE_DIRECTORY);
+ postSound({cleaner::SoundEventType::Approach,folder,entries[index].shortcut,folder&&cleaner::containsNewFolder(entries[index].name)});
  POINT cursor{};requireWin32(GetCursorPos(&cursor),"GetCursorPos");glide(cursor,start);
  logFile.write("DRAG press source="+utf8(entries[index].path));
- DragRelease release;mouseInput(MOUSEEVENTF_LEFTDOWN,start);release.pressed=true;waitMs(80);glide(start,bin);
+ DragRelease release;mouseInput(MOUSEEVENTF_LEFTDOWN,start);release.pressed=true;waitMs(55);postSound({cleaner::SoundEventType::Carry,folder});glide(start,bin);
 
  mouseInput(MOUSEEVENTF_LEFTUP,bin);release.pressed=false;waitMs(500);
  logFile.write("DRAG released dropReceived="+std::to_string(dropReceived));
@@ -340,24 +362,21 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
  DWORD result=WaitForSingleObject(ready,INFINITE);CloseHandle(ready);
  if(result!=WAIT_OBJECT_0||!keyboard||!mouse)throw std::runtime_error("Cannot install input hooks");
  enterStage("startAudioThread");audio=std::thread(audioLoop);
- enterStage("showDesktop");showDesktop();ShowWindow(targetWindow,SW_SHOWNOACTIVATE);blocked=true;
- logFile.write("INPUT_BLOCKED");enterStage("intro");
- voice(1);waitAudio();voice(2);waitAudio();
- size_t total=std::count_if(entries.begin(),entries.end(),[](const Entry& e){return e.eligible;});if(total>=15)voice(10);
+ enterStage("showDesktop");showDesktop();ShowWindow(targetWindow,SW_SHOWNOACTIVATE);
+ enterStage("intro");postSound({cleaner::SoundEventType::Start});
+ while(!workReady)waitMs(2);
  unsigned moved=0;enterStage("cleanup");
  for(size_t i=0;i<entries.size();i++){
   auto& e=entries[i];if(!e.eligible)continue;
   if(!probe(e,false)){e.eligible=false;logFile.write("RECHECK SKIP "+utf8(e.path)+" "+utf8(e.skipReason));continue;}
-  DWORD attrs=GetFileAttributesW(e.path.c_str());bool folder=attrs!=INVALID_FILE_ATTRIBUTES&&(attrs&FILE_ATTRIBUTE_DIRECTORY);
-  if(folder&&e.name==L"Новая папка"){voice(6);waitAudio();}
-  if(folder)voice(7);
-  if(moved==3){voice(9);waitMs(1100);}
-  // Auto-arrange can move both source and bin after each successful operation.
   bin=recyclePoint();requireWin32(SetWindowPos(targetWindow,HWND_TOPMOST,bin.x-24,bin.y-24,64,64,SWP_NOACTIVATE),"Position drop window");
   try{drag(i,bin);}catch(const std::exception& ex){logFile.write("ITEM ERROR path="+utf8(e.path)+" "+ex.what());e.eligible=false;}
-  if(e.moved){++moved;if(moved==1)voice(4);else if(moved==3)voice(8);else voice(5);}
+  if(e.moved)++moved;
  }
- blocked=false;logFile.write("INPUT_RELEASED moved="+std::to_string(moved));enterStage("outro");ShowWindow(targetWindow,SW_HIDE);voice(13);waitAudio();voice(15);waitAudio();
+ enterStage("outro");ShowWindow(targetWindow,SW_HIDE);
+ postSound({cleaner::SoundEventType::Finish,false,false,false,moved>0});
+ while(!soundFinished)waitMs(2);
+ blocked=false;logFile.write("INPUT_RELEASED moved="+std::to_string(moved));
  }catch(const std::exception& ex){blocked=false;status=1;logFile.write(std::string("ERROR stage=")+stage+" "+ex.what());}
  blocked=false;done=true;if(hooks.joinable())hooks.join();audioDone=true;if(audio.joinable())audio.join();
  if(registered){HRESULT h=RevokeDragDrop(targetWindow);logFile.write("DROP_UNREGISTER HRESULT="+hexCode(static_cast<unsigned long>(h)));}
