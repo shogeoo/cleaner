@@ -1,0 +1,387 @@
+#ifndef UNICODE
+#define UNICODE
+#endif
+#define _UNICODE
+#define _WIN32_WINNT 0x0601
+#include <windows.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <shlwapi.h>
+#include <exdisp.h>
+#include <servprov.h>
+#include <mmsystem.h>
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <cmath>
+#include <algorithm>
+#include <cstring>
+#include <mutex>
+#include <cstdio>
+#include <deque>
+#include <random>
+#include "sound_director.hpp"
+
+// Shell calls run on the UI STA; audio and input hooks use separate threads.
+template<class T> struct Ptr {
+ T* p=nullptr; ~Ptr(){if(p)p->Release();} T** out(){return &p;}
+ T* operator->()const{return p;} operator T*()const{return p;}
+ Ptr()=default; Ptr(const Ptr&)=delete; Ptr& operator=(const Ptr&)=delete;
+};
+class LogFile {
+ HANDLE handle=INVALID_HANDLE_VALUE;
+ std::mutex lock;
+public:
+ std::wstring directory;
+ void open(){
+  std::vector<wchar_t> path(32768);DWORD n=GetModuleFileNameW(nullptr,path.data(),static_cast<DWORD>(path.size()));
+  if(!n||n>=path.size())return;
+  std::wstring executable(path.data(),n);directory=executable.substr(0,executable.find_last_of(L"\\/"));
+  handle=CreateFileW((directory+L"\\cleaner.log").c_str(),FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+ }
+ void write(const std::string& text) noexcept {
+  try{
+  std::lock_guard<std::mutex> guard(lock);if(handle==INVALID_HANDLE_VALUE)return;
+  SYSTEMTIME t;GetLocalTime(&t);char prefix[128];snprintf(prefix,sizeof(prefix),"%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu tid=%lu ",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,GetCurrentProcessId(),GetCurrentThreadId());
+  std::string line=std::string(prefix)+text+"\r\n";DWORD written=0;WriteFile(handle,line.data(),static_cast<DWORD>(line.size()),&written,nullptr);FlushFileBuffers(handle);
+  }catch(...){/* Diagnostics must not break cleanup or input release. */}
+ }
+ ~LogFile(){if(handle!=INVALID_HANDLE_VALUE)CloseHandle(handle);}
+} logFile;
+std::string utf8(const std::wstring& text){
+ int n=WideCharToMultiByte(CP_UTF8,0,text.data(),static_cast<int>(text.size()),nullptr,0,nullptr,nullptr);std::string out(n,'\0');WideCharToMultiByte(CP_UTF8,0,text.data(),static_cast<int>(text.size()),out.data(),n,nullptr,nullptr);return out;
+}
+std::string hexCode(unsigned long code){char text[16];snprintf(text,sizeof(text),"0x%08lX",code);return text;}
+void check(HRESULT h,const char* what){if(FAILED(h))throw std::runtime_error(std::string(what)+" HRESULT="+hexCode(static_cast<unsigned long>(h)));}
+void requireWin32(BOOL ok,const char* what){if(!ok)throw std::runtime_error(std::string(what)+" Win32="+hexCode(GetLastError()));}
+const char* stage="entry";
+void enterStage(const char* value){stage=value;logFile.write(std::string("STAGE ")+stage);}
+std::atomic<bool> blocked{false}, done{false};
+HHOOK keyboard=nullptr,mouse=nullptr;
+constexpr ULONG_PTR tag=0x5052414E;
+HWND targetWindow=nullptr;
+cleaner::InputAttempts inputAttempts;
+struct Entry { std::wstring name, skipReason; BY_HANDLE_FILE_INFORMATION identity{}; bool checked=false; std::wstring path; std::vector<BYTE> child; bool recycleBin=false; bool shortcut=false; bool eligible=false; bool moved=false; };
+std::vector<Entry> entries; std::wstring pathList;
+IShellView* shellView=nullptr;
+IFolderView2* desktop=nullptr; size_t current=SIZE_MAX; bool dropReceived=false;
+std::atomic<bool> audioDone{false}, workReady{false}, soundFinished{false};
+std::mutex soundQueueLock;
+std::deque<cleaner::SoundEvent> soundQueue;
+void postSound(cleaner::SoundEvent event){
+ std::lock_guard<std::mutex> guard(soundQueueLock);soundQueue.push_back(event);
+}
+void intervention(){postSound({cleaner::SoundEventType::Interference});}
+LRESULT CALLBACK keyHook(int n,WPARAM w,LPARAM l){
+ if(n>=0){auto* k=reinterpret_cast<KBDLLHOOKSTRUCT*>(l);
+  if(k->dwExtraInfo==tag)return CallNextHookEx(keyboard,n,w,l);
+  bool down=w==WM_KEYDOWN||w==WM_SYSKEYDOWN;
+  bool fresh=inputAttempts.key(k->vkCode,down);
+  if(blocked){if(fresh)intervention();return 1;}
+ }return CallNextHookEx(keyboard,n,w,l);
+}
+LRESULT CALLBACK mouseHook(int n,WPARAM w,LPARAM l){
+ if(n>=0&&blocked){auto* m=reinterpret_cast<MSLLHOOKSTRUCT*>(l);if(m->dwExtraInfo!=tag){
+  bool attempt=w==WM_LBUTTONDOWN||w==WM_RBUTTONDOWN||w==WM_MBUTTONDOWN||w==WM_XBUTTONDOWN||w==WM_MOUSEWHEEL||w==WM_MOUSEHWHEEL;
+  if(w==WM_MOUSEMOVE)attempt=inputAttempts.mouseMove(GetTickCount64());
+  if(attempt)intervention();
+  return 1;
+ }}
+ return CallNextHookEx(mouse,n,w,l);
+}
+void pump(){MSG m;while(PeekMessageW(&m,nullptr,0,0,PM_REMOVE)){TranslateMessage(&m);DispatchMessageW(&m);}}
+void waitMs(DWORD ms){ULONGLONG until=GetTickCount64()+ms;do{pump();Sleep(5);}while(GetTickCount64()<until);}
+DWORD wavDuration(const BYTE* p,DWORD size){
+ if(size<12)return 0;
+ DWORD rate=0,data=0;
+ for(DWORD i=12;i+8<=size;){DWORD len;memcpy(&len,p+i+4,4);if(len>size-i-8)break;
+ if(!memcmp(p+i,"fmt ",4)&&len>=16)memcpy(&rate,p+i+8+8,4);
+ if(!memcmp(p+i,"data",4))data=len;
+ if(len>MAXDWORD-i-9)break;
+ i+=8+len+(len&1);}
+ return rate?static_cast<DWORD>((1000ull*data+rate-1)/rate):0;
+}
+void audioLoop(){
+ std::array<const BYTE*,17> recordings{};std::array<cleaner::Millis,17> durations{};
+ for(int id:{1,2,3,4,5,6,7,8,9,10,11,13,15}){
+  HRSRC r=FindResourceW(nullptr,MAKEINTRESOURCEW(id),RT_RCDATA);
+  recordings[id]=r?static_cast<const BYTE*>(LockResource(LoadResource(nullptr,r))):nullptr;
+  durations[id]=recordings[id]?wavDuration(recordings[id],SizeofResource(nullptr,r)):0;
+ }
+ std::mt19937 random(static_cast<unsigned>(GetTickCount64()^GetCurrentProcessId()));
+ cleaner::SoundDirector director(durations,[&](unsigned upper){return std::uniform_int_distribution<unsigned>(0,upper-1)(random);});
+ std::uint64_t applied=0;
+ auto render=[&]{
+  if(director.generation()==applied)return;
+  int id=director.currentClip();
+  PlaySoundW(nullptr,nullptr,0);
+  if(id==1){blocked=true;logFile.write("INPUT_BLOCKED first recording");}
+  bool ok=id&&recordings[id]&&PlaySoundW(reinterpret_cast<LPCWSTR>(recordings[id]),nullptr,SND_MEMORY|SND_ASYNC|SND_NODEFAULT);
+  applied=director.generation();
+  logFile.write("AUDIO id="+std::to_string(id)+" generation="+std::to_string(applied)+" started="+std::to_string(ok)+" durationMs="+std::to_string(id?durations[id]:0));
+ };
+ while(!audioDone){
+  std::deque<cleaner::SoundEvent> events;
+  {std::lock_guard<std::mutex> guard(soundQueueLock);events.swap(soundQueue);}
+  for(const auto& event:events){director.event(event,GetTickCount64());render();}
+  director.tick(GetTickCount64());render();
+  if(director.phase()==cleaner::SoundPhase::Work)workReady=true;
+  if(director.phase()==cleaner::SoundPhase::Finished)soundFinished=true;
+  Sleep(2);
+ }
+ PlaySoundW(nullptr,nullptr,0);
+}
+
+std::vector<BYTE> pidlBytes(PCUIDLIST_RELATIVE p){UINT n=ILGetSize(p);return std::vector<BYTE>(reinterpret_cast<const BYTE*>(p),reinterpret_cast<const BYTE*>(p)+n);}
+PCUITEMID_CHILD childPidl(const std::vector<BYTE>& v){return reinterpret_cast<PCUITEMID_CHILD>(v.data());}
+void getDesktop(){
+ Ptr<IShellWindows> windows;check(CoCreateInstance(CLSID_ShellWindows,nullptr,CLSCTX_ALL,IID_PPV_ARGS(windows.out())),"Cannot access Explorer");
+ VARIANT location,empty;VariantInit(&location);VariantInit(&empty);location.vt=VT_I4;location.lVal=CSIDL_DESKTOP;long hwnd=0;Ptr<IDispatch> dispatch;
+ check(windows->FindWindowSW(&location,&empty,SWC_DESKTOP,&hwnd,SWFO_NEEDDISPATCH,dispatch.out()),"Desktop not found");
+ if(!dispatch)throw std::runtime_error("Explorer returned no desktop dispatch");
+ Ptr<IServiceProvider> service;check(dispatch->QueryInterface(IID_PPV_ARGS(service.out())),"Desktop service unavailable");
+ Ptr<IShellBrowser> browser;check(service->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(browser.out())),"Desktop browser unavailable");
+ check(browser->QueryActiveShellView(&shellView),"Desktop view unavailable");
+ if(!shellView)throw std::runtime_error("Explorer returned no active shell view");
+ check(shellView->QueryInterface(IID_PPV_ARGS(&desktop)),"Desktop folder view unavailable");
+}
+std::wstring display(IShellItem* item,SIGDN kind){PWSTR p=nullptr;if(FAILED(item->GetDisplayName(kind,&p)))return {};std::wstring s=p;CoTaskMemFree(p);return s;}
+POINT screenPoint(POINT point){
+ // QueryActiveShellView already provided IShellView, which inherits GetWindow.
+ // Requesting IOleWindow from the marshalled IFolderView proxy is unnecessary.
+ HWND view=nullptr;check(shellView->GetWindow(&view),"IShellView::GetWindow");
+ if(!view||!IsWindow(view))throw std::runtime_error("Invalid desktop view window");
+ HWND list=FindWindowExW(view,nullptr,L"SysListView32",nullptr);
+ requireWin32(ClientToScreen(list?list:view,&point),"ClientToScreen desktop icon");return point;
+}
+POINT iconCenter(const Entry& e){
+ POINT position{};check(desktop->GetItemPosition(childPidl(e.child),&position),"GetItemPosition");
+ POINT spacing{};HRESULT h=desktop->GetSpacing(&spacing);
+ if(FAILED(h)||spacing.x<=0){
+  logFile.write("GetSpacing fallback HRESULT="+hexCode(static_cast<unsigned long>(h)));
+  h=desktop->GetDefaultSpacing(&spacing);
+  if(FAILED(h)||spacing.x<=0)spacing.x=GetSystemMetrics(SM_CXICONSPACING);
+ }
+ FOLDERVIEWMODE mode=FVM_ICON;int size=GetSystemMetrics(SM_CXICON);
+ int actual=0;h=desktop->GetViewModeAndIconSize(&mode,&actual);
+ if(SUCCEEDED(h)&&actual>0)size=actual;
+ else logFile.write("GetViewModeAndIconSize fallback HRESULT="+hexCode(static_cast<unsigned long>(h)));
+ position.x+=spacing.x/2;position.y+=size/2+4;POINT screen=screenPoint(position);
+ logFile.write("ICON name="+utf8(e.name)+" screen="+std::to_string(screen.x)+","+std::to_string(screen.y)+" spacing="+std::to_string(spacing.x)+" size="+std::to_string(size));
+ return screen;
+}
+bool probeTree(const std::wstring& path,std::wstring& reason,unsigned depth=0){
+ if(depth>128){reason=L"Слишком большая глубина папок: "+path;return false;}
+ DWORD attrs=GetFileAttributesW(path.c_str());
+ if(attrs==INVALID_FILE_ATTRIBUTES||(attrs&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_SYSTEM|FILE_ATTRIBUTE_READONLY))){reason=L"Недоступный/защищённый вложенный элемент: "+path;return false;}
+ DWORD access=DELETE|FILE_READ_ATTRIBUTES;if(attrs&FILE_ATTRIBUTE_DIRECTORY)access|=FILE_LIST_DIRECTORY;
+ HANDLE h=CreateFileW(path.c_str(),access,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+ if(h==INVALID_HANDLE_VALUE){reason=L"Нет доступа или вложенный элемент занят: "+path;return false;}CloseHandle(h);
+ if(!(attrs&FILE_ATTRIBUTE_DIRECTORY))return true;
+ WIN32_FIND_DATAW data{};HANDLE find=FindFirstFileW((path+L"\\*").c_str(),&data);
+ if(find==INVALID_HANDLE_VALUE){if(GetLastError()==ERROR_FILE_NOT_FOUND)return true;reason=L"Нельзя прочитать папку: "+path;return false;}
+ bool ok=true;DWORD error=ERROR_NO_MORE_FILES;
+ do{if(wcscmp(data.cFileName,L".")&&wcscmp(data.cFileName,L"..")&&!probeTree(path+L"\\"+data.cFileName,reason,depth+1)){ok=false;break;}}while(FindNextFileW(find,&data));
+ if(ok)error=GetLastError();
+ FindClose(find);
+ if(ok&&error!=ERROR_NO_MORE_FILES){reason=L"Ошибка перечисления папки: "+path;return false;}return ok;
+}
+bool probe(Entry& e,bool record){
+ auto reject=[&](const wchar_t* reason){e.skipReason=reason;return false;};
+ DWORD attrs=GetFileAttributesW(e.path.c_str());
+ if(attrs==INVALID_FILE_ATTRIBUTES)return reject(L"Элемент исчез или атрибуты недоступны");
+ if(attrs&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_SYSTEM|FILE_ATTRIBUTE_READONLY))return reject(L"Системный, readonly или reparse-элемент");
+ Ptr<IShellItem> item;if(FAILED(SHCreateItemFromParsingName(e.path.c_str(),nullptr,IID_PPV_ARGS(item.out()))))return reject(L"Shell не может открыть элемент");
+ SFGAOF capabilities=0;if(FAILED(item->GetAttributes(SFGAO_CANDELETE|SFGAO_CANMOVE,&capabilities))||(capabilities&(SFGAO_CANDELETE|SFGAO_CANMOVE))!=(SFGAO_CANDELETE|SFGAO_CANMOVE))return reject(L"Shell не разрешает перемещение/удаление");
+ // Opening with DELETE probes permissions and sharing restrictions; nothing is deleted.
+ HANDLE source=CreateFileW(e.path.c_str(),DELETE|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+ if(source==INVALID_HANDLE_VALUE)return reject(L"Нет DELETE-доступа или элемент занят без FILE_SHARE_DELETE");
+ BY_HANDLE_FILE_INFORMATION info{};bool got=GetFileInformationByHandle(source,&info)!=FALSE;CloseHandle(source);
+ if(!got)return reject(L"Не удалось проверить идентификатор элемента");
+ if(!record&&e.checked&&(info.dwVolumeSerialNumber!=e.identity.dwVolumeSerialNumber||info.nFileIndexHigh!=e.identity.nFileIndexHigh||info.nFileIndexLow!=e.identity.nFileIndexLow))return reject(L"По исходному пути теперь другой объект");
+ if((attrs&FILE_ATTRIBUTE_DIRECTORY)&&!probeTree(e.path,e.skipReason))return false;
+ if(record){e.identity=info;e.checked=true;}e.skipReason.clear();return true;
+}
+void writePathList(){
+ // Preserve original paths as requested. No restore commands or diagnostic sidecars.
+ std::wstring text=L"status\tname\toriginal_path\treason\n";
+ for(auto& e:entries)text+=(e.eligible?L"READY":L"SKIP")+std::wstring(L"\t")+e.name+L"\t"+e.path+L"\t"+e.skipReason+L"\n";
+ int size=WideCharToMultiByte(CP_UTF8,0,text.data(),static_cast<int>(text.size()),nullptr,0,nullptr,nullptr);
+ std::string bytes(size,'\0');WideCharToMultiByte(CP_UTF8,0,text.data(),static_cast<int>(text.size()),bytes.data(),size,nullptr,nullptr);
+ HANDLE h=CreateFileW(pathList.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+ if(h==INVALID_HANDLE_VALUE)requireWin32(FALSE,"Cannot save original paths beside executable");
+ DWORD written=0;bool ok=WriteFile(h,bytes.data(),static_cast<DWORD>(bytes.size()),&written,nullptr)&&written==bytes.size()&&FlushFileBuffers(h);DWORD error=GetLastError();CloseHandle(h);
+ if(!ok)throw std::runtime_error("Cannot flush original paths Win32="+hexCode(error));
+}
+void snapshot(){
+ Ptr<IShellItem> bin;check(SHGetKnownFolderItem(FOLDERID_RecycleBinFolder,KF_FLAG_DEFAULT,nullptr,IID_PPV_ARGS(bin.out())),"Get Recycle Bin shell item");
+ Ptr<IShellFolder> folder;check(desktop->GetFolder(IID_PPV_ARGS(folder.out())),"Cannot access desktop folder");
+ PWSTR publicPath=nullptr;check(SHGetKnownFolderPath(FOLDERID_PublicDesktop,0,nullptr,&publicPath),"Public desktop path unavailable");std::wstring publicRoot=publicPath;CoTaskMemFree(publicPath);
+ PWSTR root=nullptr;check(SHGetKnownFolderPath(FOLDERID_Desktop,0,nullptr,&root),"Desktop path unavailable");std::wstring userRoot=root;CoTaskMemFree(root);
+ int count=0;check(desktop->ItemCount(SVGIO_ALLVIEW,&count),"Cannot enumerate icons");
+ for(int i=0;i<count;i++){PITEMID_CHILD child=nullptr;if(FAILED(desktop->Item(i,&child))||!child)continue;Entry e;e.child=pidlBytes(child);
+ Ptr<IShellItem> item;HRESULT hr=SHCreateItemWithParent(nullptr,folder,child,IID_PPV_ARGS(item.out()));CoTaskMemFree(child);if(FAILED(hr))continue;e.path=display(item,SIGDN_FILESYSPATH);e.name=display(item,SIGDN_NORMALDISPLAY);e.skipReason=L"Виртуальный или системный значок";
+ SFGAOF link=0;e.shortcut=SUCCEEDED(item->GetAttributes(SFGAO_LINK,&link))&&(link&SFGAO_LINK);
+ int order=1;HRESULT comparison=item->Compare(bin,SICHINT_CANONICAL,&order);e.recycleBin=SUCCEEDED(comparison)&&order==0;
+ logFile.write("ENUM name="+utf8(e.name)+" parsing="+utf8(display(item,SIGDN_DESKTOPABSOLUTEPARSING))+" binCompare="+hexCode(static_cast<unsigned long>(comparison))+" order="+std::to_string(order));
+ if(!e.path.empty()){size_t slash=e.path.find_last_of(L"\\/");std::wstring parent=e.path.substr(0,slash);DWORD attrs=GetFileAttributesW(e.path.c_str());
+ wchar_t volume[MAX_PATH]{};bool local=GetVolumePathNameW(e.path.c_str(),volume,MAX_PATH)&&GetDriveTypeW(volume)==DRIVE_FIXED;
+ bool onDesktop=_wcsicmp(parent.c_str(),userRoot.c_str())==0||_wcsicmp(parent.c_str(),publicRoot.c_str())==0;
+ e.eligible=local&&onDesktop&&attrs!=INVALID_FILE_ATTRIBUTES;
+ if(e.eligible)e.eligible=probe(e,true);else e.skipReason=L"Недоступный путь или не локальный рабочий стол";}
+ logFile.write(std::string(e.eligible?"READY ":"SKIP ")+utf8(e.path)+" name="+utf8(e.name)+" reason="+utf8(e.skipReason));
+ entries.push_back(std::move(e));}
+ if(logFile.directory.empty())throw std::runtime_error("Cannot determine executable directory");
+ SYSTEMTIME t;GetLocalTime(&t);wchar_t name[96];swprintf(name,96,L"\\cleaner-paths-%04u%02u%02u-%02u%02u%02u-%lu.tsv",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,GetCurrentProcessId());pathList=logFile.directory+name;writePathList();
+ logFile.write("PATHS_WRITTEN "+utf8(pathList));
+}
+struct Sink : IFileOperationProgressSink {
+ ULONG refs=1; Entry* entry; HRESULT result=E_FAIL; bool captured=false;
+ explicit Sink(Entry* e):entry(e){}
+ HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** p)override{if(id==IID_IUnknown||id==IID_IFileOperationProgressSink){*p=this;AddRef();return S_OK;}*p=nullptr;return E_NOINTERFACE;}
+ ULONG STDMETHODCALLTYPE AddRef()override{return ++refs;}ULONG STDMETHODCALLTYPE Release()override{return --refs;}
+ HRESULT STDMETHODCALLTYPE StartOperations()override{return S_OK;}HRESULT STDMETHODCALLTYPE FinishOperations(HRESULT)override{return S_OK;}
+ HRESULT STDMETHODCALLTYPE PreRenameItem(DWORD,IShellItem*,LPCWSTR)override{return E_ABORT;}
+ HRESULT STDMETHODCALLTYPE PostRenameItem(DWORD,IShellItem*,LPCWSTR,HRESULT,IShellItem*)override{return S_OK;}
+ HRESULT STDMETHODCALLTYPE PreMoveItem(DWORD,IShellItem*,IShellItem*,LPCWSTR)override{return E_ABORT;}
+ HRESULT STDMETHODCALLTYPE PostMoveItem(DWORD,IShellItem*,IShellItem*,LPCWSTR,HRESULT,IShellItem*)override{return S_OK;}
+ HRESULT STDMETHODCALLTYPE PreCopyItem(DWORD,IShellItem*,IShellItem*,LPCWSTR)override{return E_ABORT;}
+ HRESULT STDMETHODCALLTYPE PostCopyItem(DWORD,IShellItem*,IShellItem*,LPCWSTR,HRESULT,IShellItem*)override{return S_OK;}
+ HRESULT STDMETHODCALLTYPE PreDeleteItem(DWORD flags,IShellItem*)override{
+ // Fail closed if Shell proposes permanent deletion, even if the bin is disabled/full.
+ logFile.write("RECYCLE preDelete flags="+hexCode(flags));
+ return (flags&TSF_DELETE_RECYCLE_IF_POSSIBLE)?S_OK:E_ABORT;
+ }
+ HRESULT STDMETHODCALLTYPE PostDeleteItem(DWORD,IShellItem*,HRESULT h,IShellItem* recycled)override{
+ result=h;logFile.write("RECYCLE result="+hexCode(static_cast<unsigned long>(h))+" binItem="+std::to_string(recycled!=nullptr));if(SUCCEEDED(h)&&recycled){
+ entry->moved=true;captured=true;postSound({cleaner::SoundEventType::Recycled});
+ if(std::none_of(entries.begin(),entries.end(),[](const Entry& e){return e.eligible&&!e.moved;}))postSound({cleaner::SoundEventType::Finish,false,false,false,true});
+ }return S_OK;
+ }
+ HRESULT STDMETHODCALLTYPE PreNewItem(DWORD,IShellItem*,LPCWSTR)override{return E_ABORT;}
+ HRESULT STDMETHODCALLTYPE PostNewItem(DWORD,IShellItem*,LPCWSTR,LPCWSTR,DWORD,HRESULT,IShellItem*)override{return S_OK;}
+ HRESULT STDMETHODCALLTYPE UpdateProgress(UINT,UINT)override{return S_OK;}
+ HRESULT STDMETHODCALLTYPE ResetTimer()override{return S_OK;}HRESULT STDMETHODCALLTYPE PauseTimer()override{return S_OK;}HRESULT STDMETHODCALLTYPE ResumeTimer()override{return S_OK;}
+};
+void recycle(Entry& e){
+ if(!probe(e,false)){e.eligible=false;logFile.write("RECHECK SKIP "+utf8(e.path)+" "+utf8(e.skipReason));return;}
+ Ptr<IShellItem> item;check(SHCreateItemFromParsingName(e.path.c_str(),nullptr,IID_PPV_ARGS(item.out())),"Item disappeared before drag");
+ Ptr<IFileOperation> op;check(CoCreateInstance(CLSID_FileOperation,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(op.out())),"File operation unavailable");
+ check(op->SetOperationFlags(FOF_ALLOWUNDO|FOF_NOCONFIRMATION|FOF_NOERRORUI|FOF_SILENT|FOF_NO_CONNECTED_ELEMENTS|FOFX_RECYCLEONDELETE|FOFX_EARLYFAILURE),"Cannot set recycle flags");
+ Sink sink(&e);check(op->DeleteItem(item,&sink),"Cannot schedule recycle");HRESULT h=op->PerformOperations();BOOL aborted=FALSE;op->GetAnyOperationsAborted(&aborted);
+ if(FAILED(h)||aborted||FAILED(sink.result)||!sink.captured)throw std::runtime_error("Windows did not confirm recycling");
+}
+struct DropTarget : IDropTarget {
+ ULONG refs=1;bool acceptable=false;
+ HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** p)override{if(id==IID_IUnknown||id==IID_IDropTarget){*p=this;AddRef();return S_OK;}*p=nullptr;return E_NOINTERFACE;}
+ ULONG STDMETHODCALLTYPE AddRef()override{return ++refs;}ULONG STDMETHODCALLTYPE Release()override{return --refs;}
+ bool matches(IDataObject* data){if(current>=entries.size())return false;Ptr<IShellItemArray> array;if(FAILED(SHCreateShellItemArrayFromDataObject(data,IID_PPV_ARGS(array.out()))))return false;DWORD count=0;array->GetCount(&count);if(count!=1)return false;Ptr<IShellItem> item;if(FAILED(array->GetItemAt(0,item.out())))return false;return _wcsicmp(display(item,SIGDN_FILESYSPATH).c_str(),entries[current].path.c_str())==0;}
+ HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data,DWORD,POINTL,DWORD* effect)override{acceptable=matches(data);logFile.write("DRAG_ENTER accepted="+std::to_string(acceptable));*effect=acceptable?DROPEFFECT_MOVE:DROPEFFECT_NONE;return S_OK;}
+ HRESULT STDMETHODCALLTYPE DragOver(DWORD,POINTL,DWORD* effect)override{*effect=acceptable?DROPEFFECT_MOVE:DROPEFFECT_NONE;return S_OK;}
+ HRESULT STDMETHODCALLTYPE DragLeave()override{acceptable=false;return S_OK;}
+ HRESULT STDMETHODCALLTYPE Drop(IDataObject* data,DWORD,POINTL,DWORD* effect)override{
+ *effect=DROPEFFECT_NONE;dropReceived=true;if(!matches(data)){logFile.write("DROP rejected: unexpected source");return E_ABORT;}
+ logFile.write("DROP received source="+utf8(entries[current].path));
+ try{recycle(entries[current]);
+ // The target has already moved the item. Never ask Explorer to delete the source again.
+ FORMATETC format{};format.cfFormat=static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_PERFORMEDDROPEFFECT));format.dwAspect=DVASPECT_CONTENT;format.lindex=-1;format.tymed=TYMED_HGLOBAL;
+ STGMEDIUM medium{};medium.tymed=TYMED_HGLOBAL;medium.hGlobal=GlobalAlloc(GMEM_MOVEABLE,sizeof(DWORD));
+ if(medium.hGlobal){auto* value=static_cast<DWORD*>(GlobalLock(medium.hGlobal));if(value){*value=DROPEFFECT_NONE;GlobalUnlock(medium.hGlobal);if(FAILED(data->SetData(&format,&medium,TRUE)))ReleaseStgMedium(&medium);}else GlobalFree(medium.hGlobal);}
+ *effect=DROPEFFECT_NONE;
+ }catch(const std::exception& ex){logFile.write(std::string("DROP ERROR ")+ex.what());auto& entry=entries[current];entry.eligible=false;entry.skipReason=L"Shell отклонила перенос";return E_FAIL;}return S_OK;
+ }
+};
+LRESULT CALLBACK windowProc(HWND h,UINT m,WPARAM w,LPARAM l){if(m==WM_MOUSEACTIVATE)return MA_NOACTIVATE;return DefWindowProcW(h,m,w,l);}
+void mouseInput(DWORD flags,POINT p){INPUT in{};in.type=INPUT_MOUSE;in.mi.dwFlags=flags;in.mi.dwExtraInfo=tag;
+ if(flags&MOUSEEVENTF_MOVE){int x=GetSystemMetrics(SM_XVIRTUALSCREEN),y=GetSystemMetrics(SM_YVIRTUALSCREEN),width=GetSystemMetrics(SM_CXVIRTUALSCREEN),height=GetSystemMetrics(SM_CYVIRTUALSCREEN);in.mi.dx=static_cast<LONG>((65536ll*(p.x-x)+32768)/std::max(1,width));in.mi.dy=static_cast<LONG>((65536ll*(p.y-y)+32768)/std::max(1,height));in.mi.dwFlags|=MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_VIRTUALDESK;}
+ if(SendInput(1,&in,sizeof(in))!=1)requireWin32(FALSE,"SendInput mouse");
+}
+void glide(POINT from,POINT to){double distance=std::hypot(double(to.x-from.x),double(to.y-from.y));int steps=std::max(1,int(std::ceil(distance/13.5)));
+ for(int i=1;i<=steps;i++){POINT p{from.x+LONG(std::lround(double(to.x-from.x)*i/steps)),from.y+LONG(std::lround(double(to.y-from.y)*i/steps))};mouseInput(MOUSEEVENTF_MOVE,p);waitMs(10);}}
+struct DragRelease {
+ bool pressed=false;
+ ~DragRelease(){if(!pressed)return;INPUT in[3]{};for(auto& x:in)x.type=INPUT_KEYBOARD;
+ in[0].ki.wVk=VK_ESCAPE;in[0].ki.dwExtraInfo=tag;in[1].ki.wVk=VK_ESCAPE;in[1].ki.dwFlags=KEYEVENTF_KEYUP;in[1].ki.dwExtraInfo=tag;
+ in[2].type=INPUT_MOUSE;in[2].mi.dwFlags=MOUSEEVENTF_LEFTUP;in[2].mi.dwExtraInfo=tag;SendInput(3,in,sizeof(INPUT));}
+};
+void drag(size_t index,POINT bin){
+ if(!probe(entries[index],false)){entries[index].eligible=false;logFile.write("RECHECK SKIP "+utf8(entries[index].path)+" "+utf8(entries[index].skipReason));return;}
+ current=index;dropReceived=false;POINT start=iconCenter(entries[index]);
+ auto selected=childPidl(entries[index].child);
+ check(desktop->SelectAndPositionItems(1,&selected,nullptr,SVSI_SELECT|SVSI_DESELECTOTHERS),"Cannot select source icon");
+ DWORD attributes=GetFileAttributesW(entries[index].path.c_str());bool folder=attributes!=INVALID_FILE_ATTRIBUTES&&(attributes&FILE_ATTRIBUTE_DIRECTORY);
+ postSound({cleaner::SoundEventType::Approach,folder,entries[index].shortcut,folder&&cleaner::containsNewFolder(entries[index].name)});
+ POINT cursor{};requireWin32(GetCursorPos(&cursor),"GetCursorPos");glide(cursor,start);
+ logFile.write("DRAG press source="+utf8(entries[index].path));
+ DragRelease release;mouseInput(MOUSEEVENTF_LEFTDOWN,start);release.pressed=true;waitMs(55);postSound({cleaner::SoundEventType::Carry,folder});glide(start,bin);
+
+ mouseInput(MOUSEEVENTF_LEFTUP,bin);release.pressed=false;waitMs(500);
+ logFile.write("DRAG released dropReceived="+std::to_string(dropReceived));
+ if(!dropReceived)throw std::runtime_error("Explorer did not deliver the mouse drop");
+ current=SIZE_MAX;
+}
+POINT recyclePoint(){
+ for(auto& e:entries)if(e.recycleBin)return iconCenter(e);
+ throw std::runtime_error("Recycle Bin icon is not visible on the desktop");
+}
+BOOL CALLBACK minimizeWindow(HWND h,LPARAM){
+ if(!IsWindowVisible(h)||h==targetWindow||h==GetShellWindow()||GetWindow(h,GW_OWNER))return TRUE;
+ wchar_t cls[128]{};GetClassNameW(h,cls,128);
+ if(wcscmp(cls,L"Shell_TrayWnd")==0||wcscmp(cls,L"Shell_SecondaryTrayWnd")==0||wcscmp(cls,L"WorkerW")==0||wcscmp(cls,L"Progman")==0)return TRUE;
+ if((GetWindowLongPtrW(h,GWL_STYLE)&WS_CAPTION)==WS_CAPTION){BOOL ok=ShowWindowAsync(h,SW_FORCEMINIMIZE);logFile.write("MINIMIZE class="+utf8(cls)+" requested="+std::to_string(ok!=FALSE));}
+ return TRUE;
+}
+void showDesktop(){EnumWindows(minimizeWindow,0);waitMs(700);}
+int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
+ logFile.open();logFile.write("START cleaner build=" __DATE__ " " __TIME__);
+ BOOL(WINAPI* dpi)(HANDLE)=nullptr;auto proc=GetProcAddress(GetModuleHandleW(L"user32.dll"),"SetProcessDpiAwarenessContext");static_assert(sizeof(dpi)==sizeof(proc));memcpy(&dpi,&proc,sizeof(dpi));if(dpi)dpi(reinterpret_cast<HANDLE>(-4));
+ enterStage("OleInitialize");HRESULT ole=OleInitialize(nullptr);
+ if(FAILED(ole)){logFile.write("ERROR OleInitialize HRESULT="+hexCode(static_cast<unsigned long>(ole)));return 1;}
+ std::thread audio, hooks;DropTarget target;bool registered=false;int status=0;
+ try{
+ enterStage("getDesktop");getDesktop();enterStage("snapshot");snapshot();
+ enterStage("locateRecycleBin");POINT bin=recyclePoint();
+ enterStage("createDropWindow");
+ WNDCLASSW cls{};cls.hInstance=instance;cls.lpfnWndProc=windowProc;cls.lpszClassName=L"DesktopPrank.Drop";requireWin32(RegisterClassW(&cls)!=0,"RegisterClassW");
+ targetWindow=CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TOPMOST,cls.lpszClassName,L"",WS_POPUP,bin.x-24,bin.y-24,64,64,nullptr,nullptr,instance,nullptr);
+ requireWin32(targetWindow!=nullptr,"CreateWindowExW drop target");
+ requireWin32(SetLayeredWindowAttributes(targetWindow,0,1,LWA_ALPHA),"SetLayeredWindowAttributes");
+ enterStage("RegisterDragDrop");check(RegisterDragDrop(targetWindow,&target),"Cannot register drop target");registered=true;
+ enterStage("installInputHooks");
+ HANDLE ready=CreateEventW(nullptr,TRUE,FALSE,nullptr);if(!ready)requireWin32(FALSE,"CreateEventW hook readiness");
+ hooks=std::thread([instance,ready]{
+  keyboard=SetWindowsHookExW(WH_KEYBOARD_LL,keyHook,instance,0);DWORD keyError=keyboard?0:GetLastError();
+  mouse=SetWindowsHookExW(WH_MOUSE_LL,mouseHook,instance,0);DWORD mouseError=mouse?0:GetLastError();
+  logFile.write("HOOKS keyboard="+hexCode(keyError)+" mouse="+hexCode(mouseError));SetEvent(ready);
+  while(!done){pump();Sleep(5);}
+  if(keyboard)UnhookWindowsHookEx(keyboard);
+  if(mouse)UnhookWindowsHookEx(mouse);
+ });
+ DWORD result=WaitForSingleObject(ready,INFINITE);CloseHandle(ready);
+ if(result!=WAIT_OBJECT_0||!keyboard||!mouse)throw std::runtime_error("Cannot install input hooks");
+ enterStage("startAudioThread");audio=std::thread(audioLoop);
+ enterStage("showDesktop");showDesktop();ShowWindow(targetWindow,SW_SHOWNOACTIVATE);
+ enterStage("intro");postSound({cleaner::SoundEventType::Start});
+ while(!workReady)waitMs(2);
+ unsigned moved=0;enterStage("cleanup");
+ for(size_t i=0;i<entries.size();i++){
+  auto& e=entries[i];if(!e.eligible)continue;
+  if(!probe(e,false)){e.eligible=false;logFile.write("RECHECK SKIP "+utf8(e.path)+" "+utf8(e.skipReason));continue;}
+  bin=recyclePoint();requireWin32(SetWindowPos(targetWindow,HWND_TOPMOST,bin.x-24,bin.y-24,64,64,SWP_NOACTIVATE),"Position drop window");
+  try{drag(i,bin);}catch(const std::exception& ex){logFile.write("ITEM ERROR path="+utf8(e.path)+" "+ex.what());e.eligible=false;}
+  if(e.moved)++moved;
+ }
+ enterStage("outro");ShowWindow(targetWindow,SW_HIDE);
+ postSound({cleaner::SoundEventType::Finish,false,false,false,moved>0});
+ while(!soundFinished)waitMs(2);
+ blocked=false;logFile.write("INPUT_RELEASED moved="+std::to_string(moved));
+ }catch(const std::exception& ex){blocked=false;status=1;logFile.write(std::string("ERROR stage=")+stage+" "+ex.what());}
+ blocked=false;done=true;if(hooks.joinable())hooks.join();audioDone=true;if(audio.joinable())audio.join();
+ if(registered){HRESULT h=RevokeDragDrop(targetWindow);logFile.write("DROP_UNREGISTER HRESULT="+hexCode(static_cast<unsigned long>(h)));}
+ if(targetWindow)DestroyWindow(targetWindow);
+ if(desktop)desktop->Release();
+ if(shellView)shellView->Release();
+ OleUninitialize();logFile.write("EXIT status="+std::to_string(status));return status;
+}
