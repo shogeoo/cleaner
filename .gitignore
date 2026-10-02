@@ -1,2 +1,6 @@
 /dist/
 /build/
+
+# Runtime files
+cleaner.log
+cleaner-paths-*.tsv
